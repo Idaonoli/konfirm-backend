@@ -37,4 +37,16 @@ describe('ReconcilerWatchdogService', () => {
       expect(r.stalled).toBe(false);
     }
   });
+
+  it('logs a failed query through its own logger instead of throwing', async () => {
+    const spy = jest.spyOn(pool, 'query').mockRejectedValueOnce(new Error('connection terminated') as never);
+    try {
+      const r = await svc.check();
+      expect(r).toEqual({ stalled: false, ageMinutes: null });
+      expect(errors.length).toBe(1);
+      expect(errors[0]).toMatch(/watchdog check failed: connection terminated/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });

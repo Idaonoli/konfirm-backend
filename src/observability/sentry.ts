@@ -25,3 +25,11 @@ export function captureException(err: unknown): void {
     Sentry.captureException(err);
   }
 }
+
+// Gives a queued event a chance to send before a deliberate exit. Resolves
+// immediately when Sentry isn't configured.
+export async function flushSentry(timeoutMs: number): Promise<void> {
+  if (process.env.SENTRY_DSN) {
+    await Sentry.flush(timeoutMs);
+  }
+}
