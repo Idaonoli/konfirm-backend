@@ -391,6 +391,15 @@ async fn poll_once(
             continue;
         };
 
+        let muxed_id = match i64::try_from(muxed_id) {
+            Ok(id) => id,
+            Err(_) => {
+                tracing::warn!(paging_token = %op.paging_token, muxed_id, "muxed id exceeds the signed BIGINT range — recording unmatched");
+                *cursor = op.paging_token.clone();
+                continue;
+            }
+        };
+
         let (asset_code, asset_issuer): (String, Option<String>) = match op.asset_type.as_deref() {
             Some("native") => ("XLM".to_string(), None),
             _ => (
@@ -494,7 +503,7 @@ async fn poll_once(
         // a reason. A fee that was expected but absent is flagged, not held:
         // the merchant was paid in full.
         let raw_paid: rust_decimal::Decimal = raw_amount.parse().context("horizon returned a non-decimal payment amount")?;
-        let link = store.link_expectation(merchant.id, muxed_id as i64).await?;
+        let link = store.link_expectation(merchant.id, muxed_id).await?;
         let verdict_issuer = asset_issuer.as_deref();
         let verdict = verdict::assess(link.as_ref(), raw_paid, &asset_code, verdict_issuer);
 
@@ -529,7 +538,7 @@ async fn poll_once(
         let recorded = store
             .record_payment_if_new(
                 merchant,
-                muxed_id as i64,
+                muxed_id,
                 &muxed_address,
                 &payer,
                 &asset_code,
@@ -561,6 +570,36 @@ async fn poll_once(
                 "MATCHED: payment recorded in Postgres with real fee math"
             );
             found_any = true;
+
+            if recorded.duplicate_session {
+                tracing::warn!(
+                    payment_id = %recorded.id,
+                    merchant_id = %merchant.id,
+                    muxed_id,
+                    tx_hash = %op.transaction_hash,
+                    "second payment to an already-paid session — recorded as held (duplicate_session) for review"
+                );
+            }
+
+            // Auto-deactivate the link if it is single-use (reusable=false)
+            // or has now hit its max_uses cap. Only fires when the payment
+            // landed as 'paid' (not held) and is not a duplicate session —
+            // a held or duplicate payment should never count against a link's
+            // usage budget. Done synchronously, before the compliance spawn,
+            // because deactivation is cheap (one indexed UPDATE) and must
+            // happen before the cursor advances — another checkout request
+            // arriving in the window between this payment and the next poll
+            // must see the link as inactive, not accept a new checkout.
+            if !recorded.duplicate_session && verdict.status == "paid" {
+                if let Err(err) = store.maybe_deactivate_link(recorded.link_id).await {
+                    tracing::warn!(
+                        merchant_id = %merchant.id,
+                        link_id = ?recorded.link_id,
+                        error = %err,
+                        "failed to check/deactivate link after payment — link may remain active past its cap"
+                    );
+                }
+            }
 
             // Already flagged and held via the cheap local check above —
             // no need for the slower on-chain check too.

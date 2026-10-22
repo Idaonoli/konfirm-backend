@@ -1,6 +1,5 @@
 import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Asset, BASE_FEE, Horizon, Memo, Operation, TransactionBuilder } from '@stellar/stellar-sdk';
-import type { PoolClient } from 'pg';
 import { pool } from '../db/pool';
 import { platformFeeAddress } from '../common/platform-fee';
 import { HORIZON_URL, NETWORK_PASSPHRASE } from '../common/stellar-network';
@@ -18,12 +17,21 @@ import { fromStroops, toStroops } from '../common/money-rules';
 
 const SETTLEMENT_TTL_SECONDS = 15 * 60;
 const SETTLEMENT_MEMO = 'Konfirm fees';
+// Arbitrary but stable pg_advisory_lock key, namespaced away from the other
+// sweepers' keys (402_001 to 402_005).
+const SWEEP_LOCK_KEY = 402_006;
 
 export interface OwedTotal {
   asset_code: string;
   asset_issuer: string | null;
   amount: string;
   payments: number;
+}
+
+export interface SettlementSelection {
+  amount: string;
+  asset_code: string;
+  asset_issuer?: string | null;
 }
 
 interface PaymentFeeRow {
@@ -72,10 +80,8 @@ export class FeesService {
     return { totals, payments: rows.length };
   }
 
-  // Builds the settlement for everything currently owed. If a settlement is
-  // already waiting for the merchant's signature, returns that one, so a
-  // double click doesn't create a second transaction over the same fees.
-  async createSettlement(merchantId: string) {
+  // Builds a settlement for all owed fees, or a requested portion of one asset.
+  async createSettlement(merchantId: string, selection?: SettlementSelection) {
     const merchantRes = await pool.query('SELECT stellar_base_address FROM merchants WHERE id = $1', [merchantId]);
     const merchantAddress: string | null = merchantRes.rows[0]?.stellar_base_address ?? null;
     if (!merchantAddress) throw new BadRequestException('add a Stellar address to your account before settling fees');
@@ -99,6 +105,7 @@ export class FeesService {
       const { rows } = await client.query<PaymentFeeRow>(
         `SELECT id, fee_owed_raw::text, fee_asset_code, fee_asset_issuer
          FROM payments WHERE merchant_id = $1 AND fee_status = 'owed' AND status = 'paid'
+         ORDER BY created_at, id
          FOR UPDATE`,
         [merchantId],
       );
@@ -107,7 +114,36 @@ export class FeesService {
         throw new NotFoundException('no fees are owed');
       }
 
-      const totals = totalsByAsset(rows);
+      let selectedRows = rows;
+      let remaining = selection ? toStroops(selection.amount) : null;
+      if (selection) {
+        if (remaining! <= 0n) throw new BadRequestException('settlement amount must be greater than zero');
+        selectedRows = rows.filter((row) => row.fee_asset_code === selection.asset_code);
+        if (selection.asset_issuer !== undefined) {
+          selectedRows = selectedRows.filter((row) => row.fee_asset_issuer === selection.asset_issuer);
+        } else if (selection.asset_code === 'XLM') {
+          selectedRows = selectedRows.filter((row) => row.fee_asset_issuer === null);
+        } else if (new Set(selectedRows.map((row) => row.fee_asset_issuer)).size > 1) {
+          throw new BadRequestException('specify the asset issuer to settle this asset');
+        }
+        const available = selectedRows.reduce((sum, row) => sum + toStroops(row.fee_owed_raw), 0n);
+        if (remaining! > available) throw new BadRequestException('settlement amount exceeds the amount owed for this asset');
+      }
+
+      const allocations: Array<{ row: PaymentFeeRow; amount: bigint }> = [];
+      for (const row of selectedRows) {
+        if (remaining !== null && remaining === 0n) break;
+        const owed = toStroops(row.fee_owed_raw);
+        const amount = remaining === null || remaining > owed ? owed : remaining;
+        if (amount > 0n) allocations.push({ row, amount });
+        if (remaining !== null) remaining -= amount;
+      }
+      if (allocations.length === 0) {
+        await client.query('ROLLBACK');
+        throw new NotFoundException('no fees are owed for this asset');
+      }
+
+      const totals = totalsByAsset(allocations.map(({ row, amount }) => ({ ...row, fee_owed_raw: fromStroops(amount) })));
       const builder = await this.buildUnsigned(merchantAddress, totals);
       const tx = builder.build();
       const expiresAt = new Date((tx.timeBounds ? Number(tx.timeBounds.maxTime) : Math.floor(Date.now() / 1000) + SETTLEMENT_TTL_SECONDS) * 1000);
@@ -121,9 +157,15 @@ export class FeesService {
       );
       const settlementId = ins.rows[0].id;
       await client.query(
+        `INSERT INTO fee_settlement_items (settlement_id, payment_id, amount)
+         SELECT $1, payment_id, amount::numeric
+         FROM unnest($2::uuid[], $3::text[]) AS allocation(payment_id, amount)`,
+        [settlementId, allocations.map(({ row }) => row.id), allocations.map(({ amount }) => fromStroops(amount))],
+      );
+      await client.query(
         `UPDATE payments SET fee_status = 'claimed', fee_settlement_id = $2
          WHERE id = ANY($1::uuid[])`,
-        [rows.map((r) => r.id), settlementId],
+        [allocations.map(({ row }) => row.id), settlementId],
       );
       await client.query('COMMIT');
       return this.describeSettlement(settlementId, unsignedXdr, expiresAt, merchantId);
@@ -156,13 +198,25 @@ export class FeesService {
   }
 
   private async describeSettlement(id: string, unsignedXdr: string, expiresAt: Date, merchantId: string) {
-    const owed = await this.owed(merchantId);
+    const { rows } = await pool.query(
+      `SELECT p.fee_asset_code, p.fee_asset_issuer, SUM(i.amount)::text AS amount,
+              COUNT(DISTINCT i.payment_id)::int AS payments
+       FROM fee_settlement_items i JOIN payments p ON p.id = i.payment_id
+       WHERE i.settlement_id = $1 AND p.merchant_id = $2
+       GROUP BY p.fee_asset_code, p.fee_asset_issuer`,
+      [id, merchantId],
+    );
     return {
       settlement_id: id,
       unsigned_xdr: unsignedXdr,
       network_passphrase: NETWORK_PASSPHRASE,
       expires_at: expiresAt,
-      totals: owed.totals,
+      totals: rows.map((row) => ({
+        asset_code: row.fee_asset_code,
+        asset_issuer: row.fee_asset_issuer,
+        amount: fromStroops(toStroops(row.amount)),
+        payments: row.payments,
+      })),
     };
   }
 
@@ -179,7 +233,12 @@ export class FeesService {
     if (s.status !== 'pending') throw new ConflictException(`this settlement is already ${s.status}`);
     if (new Date(s.expires_at) <= new Date()) throw new ConflictException('this settlement expired — create a new one');
 
-    const tx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+    let tx: ReturnType<typeof TransactionBuilder.fromXDR>;
+    try {
+      tx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+    } catch {
+      throw new BadRequestException('malformed signed transaction');
+    }
     if (Buffer.from(tx.hash()).toString('hex') !== s.tx_hash) {
       throw new BadRequestException('the signed transaction is not the one Konfirm built for this settlement');
     }
@@ -187,6 +246,8 @@ export class FeesService {
       await this.horizon.submitTransaction(tx);
     } catch (err) {
       const codes = (err as { response?: { data?: { extras?: { result_codes?: unknown } } } })?.response?.data?.extras?.result_codes;
+      const detail = codes === undefined ? (err instanceof Error ? err.message : String(err)) : JSON.stringify(codes);
+      await this.failSubmission(settlementId, detail);
       throw new BadRequestException({
         message: 'the network rejected the settlement',
         result_codes: codes ?? null,
@@ -196,16 +257,118 @@ export class FeesService {
     return { ok: true, settlement_id: settlementId, tx_hash: s.tx_hash };
   }
 
-  private async confirm(settlementId: string, client: { query: PoolClient['query'] } = pool) {
-    await client.query(`UPDATE fee_settlements SET status = 'confirmed', confirmed_at = NOW() WHERE id = $1 AND status = 'pending'`, [settlementId]);
-    await client.query(`UPDATE payments SET fee_status = 'settled' WHERE fee_settlement_id = $1`, [settlementId]);
+  // Both updates commit together, same as release(). Without the transaction,
+  // a crash or query error between them would leave the settlement confirmed
+  // and its payments stuck at 'claimed' with no way forward. A fully settled
+  // payment keeps its link to the settlement that cleared it. A partially
+  // settled one goes back to owed for the remainder and can be claimed again.
+  private async confirm(settlementId: string) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rowCount } = await client.query(
+        `UPDATE fee_settlements SET status = 'confirmed', confirmed_at = NOW(), submission_error = NULL
+         WHERE id = $1 AND status = 'pending'`,
+        [settlementId],
+      );
+      if (rowCount) {
+        await client.query(
+          `UPDATE payments p
+           SET fee_owed_raw = p.fee_owed_raw - i.amount,
+               fee_status = CASE WHEN p.fee_owed_raw - i.amount <= 0 THEN 'settled' ELSE 'owed' END,
+               fee_settlement_id = CASE WHEN p.fee_owed_raw - i.amount <= 0 THEN p.fee_settlement_id ELSE NULL END
+           FROM fee_settlement_items i
+           WHERE i.settlement_id = $1 AND p.id = i.payment_id AND p.fee_status = 'claimed'`,
+          [settlementId],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async disputeSettlement(merchantId: string, settlementId: string) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `UPDATE fee_settlements SET status = 'disputed'
+         WHERE id = $1 AND merchant_id = $2 AND status = 'pending'
+         RETURNING id`,
+        [settlementId, merchantId],
+      );
+      if (rows.length === 0) {
+        const existing = await client.query('SELECT status FROM fee_settlements WHERE id = $1 AND merchant_id = $2', [settlementId, merchantId]);
+        await client.query('ROLLBACK');
+        if (!existing.rows[0]) throw new NotFoundException('settlement not found');
+        throw new ConflictException(`this settlement is already ${existing.rows[0].status}`);
+      }
+      await client.query(
+        `UPDATE payments SET fee_status = 'owed', fee_settlement_id = NULL
+         WHERE fee_settlement_id = $1 AND fee_status = 'claimed'`,
+        [settlementId],
+      );
+      await client.query('COMMIT');
+      return { ok: true, settlement_id: settlementId, status: 'disputed' };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async failSubmission(settlementId: string, detail: string) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE fee_settlements SET submission_error = $2
+         WHERE id = $1 AND status = 'pending'`,
+        [settlementId, detail],
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   // Runs on a schedule. A settlement the merchant signed and submitted outside
   // the app (for example from another wallet tool) is picked up here, because
   // its hash is already known. A settlement that expired unsigned releases its
   // claims back to owed.
+  //
+  // Takes a session advisory lock first, same as every other sweeper, so two
+  // sweeps (an overlapping cron tick, or another api replica) never run at
+  // once. The WHERE guards in confirm() and release() already make a second
+  // concurrent sweep a no-op today, but that only holds while both stay
+  // idempotent. The lock keeps it true if either ever gains a side effect.
   async sweepPending(): Promise<{ confirmed: number; expired: number }> {
+    const client = await pool.connect();
+    try {
+      const { rows } = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock($1) AS locked', [SWEEP_LOCK_KEY]);
+      if (!rows[0].locked) {
+        // Another sweep is already running.
+        return { confirmed: 0, expired: 0 };
+      }
+      try {
+        return await this.sweepPendingLocked();
+      } finally {
+        await client.query('SELECT pg_advisory_unlock($1)', [SWEEP_LOCK_KEY]);
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  private async sweepPendingLocked(): Promise<{ confirmed: number; expired: number }> {
     const { rows } = await pool.query(
       `SELECT id, tx_hash, expires_at FROM fee_settlements WHERE status = 'pending' ORDER BY created_at LIMIT 200`,
     );
@@ -234,8 +397,20 @@ export class FeesService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`UPDATE payments SET fee_status = 'owed', fee_settlement_id = NULL WHERE fee_settlement_id = $1 AND fee_status = 'claimed'`, [settlementId]);
-      await client.query(`UPDATE fee_settlements SET status = 'expired' WHERE id = $1 AND status = 'pending'`, [settlementId]);
+      // Settlement first, guarded on 'pending': if confirm() won the row,
+      // this touches nothing and the payments stay settled.
+      const { rowCount } = await client.query(
+        `UPDATE fee_settlements SET status = 'expired'
+         WHERE id = $1 AND status = 'pending'`,
+        [settlementId],
+      );
+      if (rowCount) {
+        await client.query(
+          `UPDATE payments SET fee_status = 'owed', fee_settlement_id = NULL
+           WHERE fee_settlement_id = $1 AND fee_status = 'claimed'`,
+          [settlementId],
+        );
+      }
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);

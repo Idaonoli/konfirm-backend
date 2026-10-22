@@ -16,7 +16,7 @@ Cashing out to a bank account is a real SEP-10 (auth) + SEP-24 (interactive with
 
 ## Tech stack
 
-- **NestJS 10** / TypeScript, `ts-node` (no build step in dev — there is no hot reload either; restart the process after editing anything under `src/`)
+- **NestJS 11** / TypeScript, `ts-node` (no build step in dev — there is no hot reload either; restart the process after editing anything under `src/`)
 - **PostgreSQL**, raw `pg` pool — no ORM. Migrations are plain, ordered SQL files in `db/migrations/`
 - **Zod** for request validation at every controller boundary
 - **`@stellar/stellar-sdk`** for building/reading transactions server-side
@@ -24,7 +24,7 @@ Cashing out to a bank account is a real SEP-10 (auth) + SEP-24 (interactive with
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 22+
 - PostgreSQL 15+, running locally
 - Rust (stable) — only needed to run the reconciler
 - The [`stellar` CLI](https://developers.stellar.org/docs/tools/cli/install-cli), on `PATH`, with a `deployer` identity configured (`stellar keys add deployer --secret-key ...`) — needed by the reconciler's on-chain compliance check (`compliance.rs`, still CLI-shelled) and, locally only, as a convenience fallback if `STELLAR_DEPLOYER_SECRET_KEY` is unset (`x402.service.ts` resolves the facilitator's signing key via `stellar keys secret deployer` in that case). The API's own compliance checks (`payments.service.ts`, `x402.service.ts`) call the compliance contract directly over Soroban RPC — no CLI involved — see [Compliance](#compliance) below.
@@ -50,6 +50,7 @@ node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
 | `APP_URL` | Yes in production | Public frontend origin, used to build password-reset links |
 | `MAIL_WEBHOOK_URL` | Yes in production | Relay that receives `{ to, subject, text }` as JSON for transactional email. Without it, production logs `NOT SENT` and no reset email goes out (`src/mail/mailer.ts`) |
 | `MAIL_WEBHOOK_TOKEN` | No | Sent as a Bearer token to `MAIL_WEBHOOK_URL` when set |
+| `MAIL_LOG_FALLBACK` | No | Without `MAIL_WEBHOOK_URL`, mail bodies (including reset links) are printed to the log only when `NODE_ENV=development` exactly, or when this is set to exactly `true`. Any other environment (unset, staging, preview) drops the mail and logs only its subject. Never set it anywhere others can read the logs. Ignored in production |
 | `TRUST_PROXY_HOPS` | No | Reverse-proxy hops in front of the API. Defaults to `1` in production (Railway's edge). Rate limits key on the client address, so this must match the real chain. Too high lets clients forge `X-Forwarded-For` |
 | `ENABLE_TESTNET_FAUCET` | No | Set to exactly `true` to open the `/deposits` testnet faucet. Off by default, so production answers those routes with 404 |
 | `PORT` | No | Defaults to `3001` |
@@ -98,8 +99,26 @@ All endpoints are JSON unless noted. Routes marked 🔒 require a valid `konfirm
 |---|---|---|---|
 | `POST` | `/auth/signup` | `email, password, name, stellar_base_address` | Creates the merchant, logs them in immediately |
 | `POST` | `/auth/login` | `email, password` | Same error for wrong email or wrong password — no account enumeration |
-| `POST` | `/auth/logout` | — | Revokes all of the merchant's sessions (bumps `session_version`) and clears the cookie |
+| `POST` | `/auth/logout` | — | Revokes the current session (merchant or member) and clears the cookie |
 | `GET` | `/auth/me` 🔒 | — | Current merchant's claims |
+
+#### Team / multi-user
+
+A merchant account can have multiple members, each with their own email, password, and role (`owner` or `staff`). Sessions from both paths carry `merchant_id` as `id` in the JWT, so all downstream guards and services work unchanged.
+
+Existing merchants (signed up before this feature) call `POST /auth/team/bootstrap-owner` once with a new team-specific password to create their `merchant_members` owner row, then use `POST /auth/team/login` going forward. New merchants signing up via `/auth/signup` continue to use `/auth/login` as before; bootstrap is only needed to unlock the invite endpoints.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| `POST` | `/auth/team/bootstrap-owner` 🔒 | `password` | One-time setup for existing merchants — creates the owner row in `merchant_members`. Idempotent. Must be called before using invite/remove endpoints |
+| `POST` | `/auth/team/login` | `email, password` | Log in as a team member (queries `merchant_members`). Issues the same `konfirm_session` cookie; `member_id` and `role` are embedded in the JWT |
+| `POST` | `/auth/team/invite` 🔒 | `email, role?` | Sends a 48-hour invite email. Owner role only. Re-sending to the same address invalidates the previous open invite |
+| `POST` | `/auth/team/invite/accept` | `token, name, password` | Consumes the invite token, creates the member account, and issues a session cookie immediately |
+| `GET` | `/auth/team/members` 🔒 | — | All members for the authenticated merchant |
+| `GET` | `/auth/team/invites` 🔒 | — | Pending (open, unexpired) invites |
+| `DELETE` | `/auth/team/members/:id` 🔒 | — | Remove a member. Owner only. Cannot remove the last owner |
+
+Admin visibility: `GET /admin/merchants/:id/team` (members + pending invites), `DELETE /admin/merchants/:id/team/members/:memberId` (force-remove, no role guard, logged to `admin_actions`).
 
 ### Links
 
@@ -129,6 +148,16 @@ All endpoints are JSON unless noted. Routes marked 🔒 require a valid `konfirm
 | `GET` | `/withdrawals/status` 🔒 | `token, id` | Polls the anchor's transaction status |
 | `POST` | `/withdrawals/prepare-payment` 🔒 | `currency, token, id` | Once the anchor is ready (`pending_user_transfer_start`), builds the on-chain payment to the anchor's account for the merchant to sign |
 
+### Fees
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| `GET` | `/fees/owed` 🔒 | — | Owed totals grouped by asset |
+| `GET` | `/fees/settlements` 🔒 | — | Recent settlement status for this merchant |
+| `POST` | `/fees/settlements` 🔒 | optional `amount, asset_code, asset_issuer` | Builds a full or partial unsigned settlement |
+| `POST` | `/fees/settlements/:id/submit` 🔒 | `signed_xdr` | Verifies and submits the merchant-signed transaction |
+| `POST` | `/fees/settlements/:id/dispute` 🔒 | — | Disputes a settlement before signing and releases its claims |
+
 ### Admin
 
 This table lists every route in `src/admin/admin.controller.ts`, and every route there sits behind `AdminGuard`. Routes marked 🔐 require a valid `konfirm_admin_session` cookie — a completely separate identity from a merchant's `konfirm_session` (see [Admin auth](#admin-auth) below).
@@ -138,6 +167,7 @@ This table lists every route in `src/admin/admin.controller.ts`, and every route
 | `POST` | `/admin/auth/login` | `email, password` | Same no-enumeration error as merchant login |
 | `POST` | `/admin/auth/logout` | — | Revokes all of the admin's sessions (bumps `session_version`) and clears the cookie |
 | `GET` | `/admin/auth/me` 🔐 | — | Current admin's claims |
+| `POST` | `/admin/auth/change-password` 🔐 | `current_password, new_password` | Rotates the admin's own password, signs out every other session, re-issues this session's cookie, and logs `admin.change-password` to `admin_actions` |
 | `GET` | `/admin/stats` 🔐 | — | Real Postgres aggregates for the Overview dashboard: merchant counts by status, today's payment count/volume, a zero-filled 7-day daily volume series — nothing fabricated for the sake of a fuller-looking chart |
 | `GET` | `/admin/merchants` 🔐 | — | All merchants, newest first (`?limit`, `?offset`) |
 | `PATCH` | `/admin/merchants/:id/status` 🔐 | `status: 'active'\|'suspended', reason?` | Takes effect immediately — see below, this isn't just a future-login gate |
@@ -151,11 +181,15 @@ This table lists every route in `src/admin/admin.controller.ts`, and every route
 | `GET` | `/admin/withdrawal-attempts` 🔐 | — | Merchant cash-outs Konfirm has observed being started, with the anchor's last known status |
 | `POST` | `/admin/merchants/:id/password-reset` 🔐 | `reason` (required) | Emails the merchant a reset link. Only for an active account. Logged as `merchant.password-reset-sent`. Admins never see or set the password |
 | `PATCH` | `/admin/merchants/:id/tier` 🔐 | `risk_tier`, `reason?` | Sets the merchant's risk tier |
+| `GET` | `/admin/merchants/:id/team` 🔐 | — | All team members + pending invites for a merchant |
+| `DELETE` | `/admin/merchants/:id/team/members/:memberId` 🔐 | — | Force-remove a member (no role guard, logged to `admin_actions`) |
 | `GET` | `/admin/links` 🔐 | — | Payment links across every merchant |
 | `GET` | `/admin/blockchain/status` 🔐 | — | Deployed contract addresses and their live status |
 | `GET` | `/admin/notifications` 🔐 | — | Events derived live from existing rows: x402 settlements, disputed payments, stuck withdrawals, blocks. Nothing is stored separately |
 | `GET` | `/admin/treasury/status` 🔐 | — | Treasury contract state and balances |
 | `GET` | `/admin/fee-revenue/summary` 🔐 | — | Fee revenue totals from confirmed payments |
+| `GET` | `/admin/fees/owed` 🔐 | — | Owed fees, including whether a merchant has disputed settlements |
+| `GET` | `/admin/fees/disputed` 🔐 | — | Disputed settlements awaiting review |
 | `GET` | `/admin/fee-revenue/daily` 🔐 | — | Daily fee revenue series |
 | `GET` | `/admin/users` 🔐 | — | Every payer address, with payment count and volume across all statuses |
 | `GET` | `/admin/wallets` 🔐 | — | Every address in the system with its roles (merchant, payer, blocked), in one directory |
@@ -264,9 +298,16 @@ actually need to be correct. Three layers:
   muxed-address-vs-memo routing bug earlier in this project's life automatically, rather than needing
   a human to notice a wallet crash days later.
 
-What this suite deliberately does **not** cover: actually signing and submitting a transaction (needs
-a real wallet holding a private key — a browser-and-a-human problem, not a CI problem) and the
-SEP-10/24 anchor's interactive popup (same reason). Those stay manually tested.
+The critical-path suite deliberately does **not** cover actually signing and submitting a
+transaction; the live fee-settlement suite does, using a generated merchant keypair against
+testnet. The SEP-10/24 anchor's interactive popup still needs a browser and a human, so that stays
+manually tested.
+
+Use sequential calls when each result intentionally sets up the next assertion. Use a concurrent
+test (see `test/helpers/concurrent.ts`) when correctness depends on check-then-write behavior,
+locking, uniqueness, or a shared limit; sequential calls cannot expose those races.
+`npm run test:fast` is the local/CI Postgres suite, while `npm run test:live` exercises flows that require
+real Stellar testnet and Friendbot availability.
 
 ## Migrations
 
@@ -551,3 +592,8 @@ I don't have credentials for any of this — these steps need to be done directl
 ## License
 
 [MIT](LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-62 -->
+- #62: README API reference omits the referral and public Bazaar endpoints

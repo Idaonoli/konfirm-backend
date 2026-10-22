@@ -131,6 +131,11 @@ export class FeeCollectionSweepService {
     }
     const sweepUsdc = Number(sweepStroops) / STROOPS_PER_UNIT;
 
+    // Submit first, record spend only once the transfer is known to have
+    // succeeded -- a failed or timed-out attempt must not consume cap
+    // budget for money that never moved (issue #82). The cap check still
+    // runs before submission so a halted/exceeded guard blocks the sweep
+    // without ever sending a transfer.
     try {
       await this.spendGuard.checkAndRecordSpend(sweepUsdc, 'fee-sweep', TREASURY_CONTRACT_ID);
     } catch (err) {

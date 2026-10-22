@@ -4,6 +4,7 @@ import {
   FacilitatorSpendGuardService,
 } from './facilitator-spend-guard.service';
 import { pool } from '../db/pool';
+import { concurrentCalls } from '../../test/helpers/concurrent';
 
 // Real Postgres (konfirm_test, see test/env.ts), no mocks -- same
 // convention as test/admin.e2e-spec.ts. This is plain SQL-backed logic, not
@@ -31,6 +32,25 @@ describe('FacilitatorSpendGuardService', () => {
     expect(status.halted).toBe(true);
   });
 
+  it('fails closed on a non-numeric cap -- a config typo must never disable the cap', async () => {
+    process.env.FACILITATOR_DAILY_SPEND_CAP_USDC = '5000usdc';
+    await expect(guard.checkAndRecordSpend(1, 'sweep', 'typo-1')).rejects.toThrow(FacilitatorSpendCapExceeded);
+    const status = await guard.status();
+    expect(status.halted).toBe(true);
+    expect(status.haltReason).toContain('cap misconfigured');
+    expect(status.spentTodayUsdc).toBe(0);
+    // Never NaN (which JSON-serializes to null and reads as "no cap"), and
+    // the misconfiguration is reported alongside it.
+    expect(status.capUsdc).toBe(0);
+    expect(status.capConfigError).toContain('FACILITATOR_DAILY_SPEND_CAP_USDC');
+  });
+
+  it.each(['Infinity', '', '-100', '1e9', '0x10'])('treats cap value %j as misconfigured', async (raw) => {
+    process.env.FACILITATOR_DAILY_SPEND_CAP_USDC = raw;
+    await expect(guard.checkAndRecordSpend(0.01, 'sweep')).rejects.toThrow(FacilitatorSpendCapExceeded);
+    expect((await guard.status()).capConfigError).not.toBeNull();
+  });
+
   it('records spend under the cap and reflects it in status()', async () => {
     process.env.FACILITATOR_DAILY_SPEND_CAP_USDC = '100';
     await guard.checkAndRecordSpend(30, 'sweep', 'tx-1');
@@ -38,6 +58,7 @@ describe('FacilitatorSpendGuardService', () => {
     expect(status.halted).toBe(false);
     expect(status.spentTodayUsdc).toBe(30);
     expect(status.capUsdc).toBe(100);
+    expect(status.capConfigError).toBeNull();
   });
 
   it('accumulates spend across calls against the same daily cap', async () => {
@@ -49,6 +70,20 @@ describe('FacilitatorSpendGuardService', () => {
     expect(status.halted).toBe(false);
   });
 
+  it('serializes concurrent checks so they cannot jointly exceed the cap', async () => {
+    process.env.FACILITATOR_DAILY_SPEND_CAP_USDC = '100';
+    const results = await Promise.allSettled([
+      guard.checkAndRecordSpend(60, 'sweep', 'race-a'),
+      guard.checkAndRecordSpend(60, 'sweep', 'race-b'),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const status = await guard.status();
+    expect(status.spentTodayUsdc).toBe(60);
+    expect(status.halted).toBe(true);
+  });
+
   it('halts on a cap breach and rejects the over-cap operation', async () => {
     process.env.FACILITATOR_DAILY_SPEND_CAP_USDC = '100';
     await guard.checkAndRecordSpend(60, 'sweep', 'tx-1');
@@ -58,6 +93,19 @@ describe('FacilitatorSpendGuardService', () => {
     expect(status.haltReason).toContain('daily cap exceeded');
     // The rejected attempt itself must never be recorded as spend.
     expect(status.spentTodayUsdc).toBe(60);
+  });
+
+  it('serializes concurrent calls so only spend within the cap is recorded', async () => {
+    process.env.FACILITATOR_DAILY_SPEND_CAP_USDC = '100';
+    const results = await concurrentCalls(2, (index) => guard.checkAndRecordSpend(60, 'sweep', `parallel-${index}`));
+    const status = await guard.status();
+    const logged = await pool.query<{ count: string }>('SELECT COUNT(*) AS count FROM facilitator_spend_log');
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(status.halted).toBe(true);
+    expect(status.spentTodayUsdc).toBe(60);
+    expect(Number(logged.rows[0].count)).toBe(1);
   });
 
   it('stays halted for any further spend, even a small one, until resumed', async () => {

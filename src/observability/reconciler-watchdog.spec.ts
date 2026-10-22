@@ -1,10 +1,16 @@
 import { pool } from '../db/pool';
+import { FacilitatorSpendGuardService } from '../facilitator/facilitator-spend-guard.service';
 import { ReconcilerWatchdogService } from './reconciler-watchdog.service';
 
 describe('ReconcilerWatchdogService', () => {
   const svc = new ReconcilerWatchdogService();
   const errors: string[] = [];
   const realError = (svc as unknown as { logger: { error: (m: string) => void } }).logger.error;
+  const fixtureEmail = `watchdog-${Date.now()}@example.com`;
+  const originalCap = process.env.FACILITATOR_DAILY_SPEND_CAP_USDC;
+  const spendGuard = new FacilitatorSpendGuardService();
+  let fixtureMerchantId: string;
+  let fixtureSettlementId: string;
 
   beforeEach(() => {
     errors.length = 0;
@@ -12,6 +18,11 @@ describe('ReconcilerWatchdogService', () => {
   });
   afterEach(async () => {
     (svc as unknown as { logger: { error: (m: string) => void } }).logger.error = realError;
+    await pool.query('DELETE FROM fee_settlements WHERE id = $1', [fixtureSettlementId ?? null]);
+    await pool.query('DELETE FROM merchants WHERE id = $1', [fixtureMerchantId ?? null]);
+    await pool.query("DELETE FROM facilitator_state WHERE key IN ('halted_at', 'halt_reason')");
+    if (originalCap === undefined) delete process.env.FACILITATOR_DAILY_SPEND_CAP_USDC;
+    else process.env.FACILITATOR_DAILY_SPEND_CAP_USDC = originalCap;
     await pool.query("UPDATE reconciler_state SET updated_at = NOW()");
   });
   afterAll(async () => {

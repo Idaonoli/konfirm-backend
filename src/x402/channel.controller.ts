@@ -1,17 +1,20 @@
 import { BadRequestException, Body, Controller, Post } from '@nestjs/common';
+import { ApiBody, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { z } from 'zod';
 import { ZodValidationPipe } from '../zod-validation.pipe';
+import { nonNegativeIntegerStringSchema, POSTGRES_BIGINT_MAX } from '../common/numeric-validation';
 import { ChannelService } from './channel.service';
+import { zodBody } from '../common/zod-to-openapi';
 
 // channel_id/nonce/cumulative_amount travel as decimal strings (JSON has no
 // bigint) — validated as digit strings here, converted to BigInt at the
 // service boundary. Signature as hex, matching how it's stored internally
 // (src/common/channel-claim.ts, x402_channels.pending_signature).
 const claimSchema = z.object({
-  channel_id: z.string().regex(/^\d+$/, 'must be a non-negative integer string'),
-  cumulative_amount: z.string().regex(/^\d+$/, 'must be a non-negative integer string'),
-  nonce: z.string().regex(/^\d+$/, 'must be a non-negative integer string'),
+  channel_id: nonNegativeIntegerStringSchema(POSTGRES_BIGINT_MAX, 'channel_id'),
+  cumulative_amount: nonNegativeIntegerStringSchema((1n << 127n) - 1n, 'cumulative_amount'),
+  nonce: nonNegativeIntegerStringSchema(POSTGRES_BIGINT_MAX, 'nonce'),
   signature: z.string().regex(/^[0-9a-fA-F]{128}$/, 'must be a 64-byte hex-encoded ed25519 signature'),
 });
 
@@ -39,12 +42,23 @@ const closeSchema = z.object({
 // gets the cheaper 60/60s no-RPC tier since it costs a Postgres round-trip
 // and a local signature check, not a network call — the first endpoint in
 // this codebase to actually need that third throttle tier.
+@ApiTags('x402')
 @Controller('x402/channel')
 export class ChannelController {
   constructor(private readonly channel: ChannelService) {}
 
   @Post('claim')
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Submit a payment channel claim',
+    description:
+      'Records a signed incremental payment claim against an open x402 payment channel. ' +
+      'Validates the ed25519 signature locally — no Soroban RPC needed. ' +
+      'Rate-limited to 60 req/min. Unauthenticated.',
+  })
+  @ApiBody(zodBody(claimSchema, 'Channel claim request'))
+  @ApiResponse({ status: 200 | 201, description: 'Returns { accepted: true }.' })
+  @ApiResponse({ status: 400, description: 'Claim rejected (invalid signature, stale nonce, unknown channel, etc.).' })
   async claim(@Body(new ZodValidationPipe(claimSchema)) body: z.infer<typeof claimSchema>) {
     const result = await this.channel.claim({
       onchainChannelId: BigInt(body.channel_id),
@@ -60,6 +74,17 @@ export class ChannelController {
 
   @Post('open')
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Open an x402 payment channel',
+    description:
+      'Countersigns and submits a payer-built open_channel Soroban transaction. ' +
+      'The payer builds and signs the invocation client-side (auth entry embedded); ' +
+      'the facilitator countersigns as fee-sponsoring source and submits. ' +
+      'Rate-limited to 20 req/min (Soroban submission). Unauthenticated.',
+  })
+  @ApiBody(zodBody(openSchema, 'Open channel request'))
+  @ApiResponse({ status: 200 | 201, description: 'Returns { success: true, channel_id, transaction }.' })
+  @ApiResponse({ status: 400, description: 'Channel open failed.' })
   async open(@Body(new ZodValidationPipe(openSchema)) body: z.infer<typeof openSchema>) {
     const result = await this.channel.openChannel({ transactionXdr: body.transaction, resourceUrl: body.resource_url });
     if (!result.success) {
@@ -70,6 +95,16 @@ export class ChannelController {
 
   @Post('close')
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Close an x402 payment channel',
+    description:
+      'Initiates cooperative or unilateral channel close. ' +
+      'Fund realization via finalize_close happens later, driven by the channel keeper once the challenge period elapses. ' +
+      'Rate-limited to 20 req/min. Unauthenticated.',
+  })
+  @ApiBody(zodBody(closeSchema, 'Close channel request'))
+  @ApiResponse({ status: 200 | 201, description: 'Returns { success: true, transaction }.' })
+  @ApiResponse({ status: 400, description: 'Channel close failed.' })
   async close(@Body(new ZodValidationPipe(closeSchema)) body: z.infer<typeof closeSchema>) {
     const result = await this.channel.closeChannel({ transactionXdr: body.transaction });
     if (!result.success) {

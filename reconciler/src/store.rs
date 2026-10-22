@@ -25,6 +25,25 @@ pub struct Merchant {
 pub struct RecordedPayment {
     pub id: Uuid,
     pub locally_blocked: bool,
+    /// True when this muxed id already had a payment recorded, so this one
+    /// was stored 'held' with flag_reason 'duplicate_session' instead of
+    /// failing the insert. See `record_payment_if_new`.
+    pub duplicate_session: bool,
+    /// The link this payment was matched against (via link_sessions). NULL when
+    /// the payment had no session reservation — used by the caller to run
+    /// lifecycle controls (reusable / max_uses deactivation) after the insert.
+    pub link_id: Option<Uuid>,
+}
+
+/// The partial unique index allowing one primary payment per session
+/// (db/migrations/026_payments_duplicate_session.up.sql). Matched by name,
+/// so a 23505 on any *other* constraint still surfaces as an error.
+const SESSION_PAYMENT_CONSTRAINT: &str = "payments_muxed_id_idx";
+const DUPLICATE_SESSION_FLAG: &str = "duplicate_session";
+
+fn violates_constraint(err: &sqlx::Error, constraint: &str) -> bool {
+    err.as_database_error()
+        .is_some_and(|db| db.is_unique_violation() && db.constraint() == Some(constraint))
 }
 
 /// Pure decision logic for the referral-trial discount, deliberately
@@ -97,6 +116,46 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// Called synchronously after a payment is confirmed as 'paid' — deactivates
+    /// the link if:
+    ///   - reusable = false (single-use link, must stop after first payment), OR
+    ///   - max_uses IS NOT NULL AND
+    ///     COUNT of paid payments for this link >= max_uses (cap reached).
+    ///
+    /// A link_id of NULL means the payment had no session and is not tied to any
+    /// link, so this is a no-op. A link that was already inactive is also a
+    /// no-op — the WHERE clause's `active = true` guard prevents duplicate UPDATEs
+    /// and makes the call safe to retry.
+    ///
+    /// The use_count is recounted from the payments table (COUNT WHERE status='paid')
+    /// rather than being passed in, so this is always accurate against the real
+    /// committed state — no risk of an off-by-one from a cached value.
+    pub async fn maybe_deactivate_link(&self, link_id: Option<Uuid>) -> Result<()> {
+        let Some(link_id) = link_id else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE links
+             SET active = false
+             WHERE id = $1
+               AND active = true
+               AND (
+                 reusable = false
+                 OR (
+                   max_uses IS NOT NULL
+                   AND (
+                     SELECT COUNT(*) FROM payments
+                     WHERE link_id = $1 AND status = 'paid'
+                   ) >= max_uses
+                 )
+               )",
+        )
+        .bind(link_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Called by the background on-chain compliance check, never inline in
     /// the poll loop — see record_payment_if_new's doc comment for why.
     pub async fn mark_held(&self, payment_id: Uuid) -> Result<()> {
@@ -131,6 +190,14 @@ impl Store {
     /// this muxed_id — a terminal tap, an agent payment, or a payer who
     /// bypassed the API and sent XLM straight to the address — link_id is
     /// correctly NULL rather than a guess.
+    ///
+    /// A second payment to a muxed_id that already has one (a double-send,
+    /// a wallet retry, a top-up) is real money already on-chain, so it is
+    /// recorded and flagged, never dropped: it's stored as status 'held',
+    /// flag_reason 'duplicate_session', and returned with
+    /// `duplicate_session: true`. Before this, it hit the session-uniqueness
+    /// index (which ON CONFLICT (paging_token) doesn't cover), returned Err,
+    /// and stopped the caller's cursor from ever advancing past it.
     /// Recomputed fresh on every payment, not cached alongside `Merchant`
     /// (which is fetched once per `watch` run and reused across the whole
     /// session) — a promo can expire, or its volume cap can be crossed,
@@ -196,10 +263,7 @@ impl Store {
         // the high 32 bits, tx order and op order in the low 32. Decoding it
         // is the correct way to get ledger_sequence without a second round
         // trip to fetch the transaction.
-        let ledger_sequence: i64 = paging_token
-            .parse::<u64>()
-            .map(|toid| (toid >> 32) as i64)
-            .unwrap_or(0);
+        let ledger_sequence = ledger_sequence_from_paging_token(paging_token);
 
         let link_id: Option<Uuid> = sqlx::query_as::<_, (Uuid,)>(
             "SELECT link_id FROM link_sessions WHERE merchant_id = $1 AND muxed_id = $2",
@@ -215,43 +279,59 @@ impl Store {
         let status = if locally_blocked { "held" } else { verdict.status };
         let flag_reason = if locally_blocked { Some("blocked_address") } else { verdict.flag_reason };
 
-        let inserted: Option<(Uuid,)> = sqlx::query_as(
-            "INSERT INTO payments
-                (merchant_id, link_id, muxed_id, muxed_address, payer_address,
-                 asset_code, asset_issuer, amount_usdc, fee_usdc, net_usdc, fx_rate_to_usd,
-                 channel, status, paging_token, tx_hash, ledger_sequence, fee_paging_token,
-                 flag_reason, fee_status, fee_owed_raw, fee_asset_code, fee_asset_issuer)
-             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 'hosted_checkout', $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-             ON CONFLICT (paging_token) DO NOTHING
-             RETURNING id",
-        )
-        .bind(merchant.id)
-        .bind(link_id)
-        .bind(muxed_id)
-        .bind(muxed_address)
-        .bind(payer_address)
-        .bind(asset_code)
-        .bind(asset_issuer)
-        .bind(gross)
-        .bind(fee_usdc)
-        .bind(net)
-        .bind(fx_rate_to_usd)
-        .bind(status)
-        .bind(paging_token)
-        .bind(tx_hash)
-        .bind(ledger_sequence)
-        .bind(fee_paging_token)
-        .bind(flag_reason)
-        .bind(fee_status)
-        .bind(fee_owed_raw)
-        .bind(fee_asset_code)
-        .bind(fee_asset_issuer)
-        .fetch_optional(&self.pool)
-        .await?;
+        // First attempt is the normal insert; if the session already has its
+        // primary payment, the second attempt records this one flagged.
+        let mut duplicate_session = false;
+        let inserted: Option<(Uuid,)> = loop {
+            let (row_status, row_flag_reason) = if duplicate_session {
+                ("held", Some(DUPLICATE_SESSION_FLAG))
+            } else {
+                (status, flag_reason)
+            };
+            let attempt = sqlx::query_as(
+                "INSERT INTO payments
+                    (merchant_id, link_id, muxed_id, muxed_address, payer_address,
+                     asset_code, asset_issuer, amount_usdc, fee_usdc, net_usdc, fx_rate_to_usd,
+                     channel, status, paging_token, tx_hash, ledger_sequence, fee_paging_token,
+                     flag_reason, fee_status, fee_owed_raw, fee_asset_code, fee_asset_issuer)
+                 VALUES
+                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                     'hosted_checkout', $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                 ON CONFLICT (paging_token) DO NOTHING
+                 RETURNING id",
+            )
+            .bind(merchant.id)
+            .bind(link_id)
+            .bind(muxed_id)
+            .bind(muxed_address)
+            .bind(payer_address)
+            .bind(asset_code)
+            .bind(asset_issuer)
+            .bind(gross)
+            .bind(fee_usdc)
+            .bind(net)
+            .bind(fx_rate_to_usd)
+            .bind(row_status)
+            .bind(paging_token)
+            .bind(tx_hash)
+            .bind(ledger_sequence)
+            .bind(fee_paging_token)
+            .bind(row_flag_reason)
+            .bind(fee_status)
+            .bind(fee_owed_raw)
+            .bind(fee_asset_code)
+            .bind(fee_asset_issuer)
+            .fetch_optional(&self.pool)
+            .await;
+            match attempt {
+                Err(err) if !duplicate_session && violates_constraint(&err, SESSION_PAYMENT_CONSTRAINT) => {
+                    duplicate_session = true;
+                }
+                other => break other?,
+            }
+        };
 
-        Ok(inserted.map(|(id,)| RecordedPayment { id, locally_blocked }))
+        Ok(inserted.map(|(id,)| RecordedPayment { id, locally_blocked, duplicate_session, link_id }))
     }
 
     /// What the session reserved for this muxed id: its link, expected amount
@@ -382,9 +462,28 @@ impl Store {
     }
 }
 
+/// The ledger sequence encoded in a Horizon operation paging token (a TOID:
+/// ledger in the high 32 bits). 0 when the token isn't a TOID.
+fn ledger_sequence_from_paging_token(token: &str) -> i64 {
+    token.parse::<u64>().map(|toid| (toid >> 32) as i64).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn ledger_sequence_is_the_high_32_bits_of_the_toid() {
+        // Ledger 123456, tx order 7, op order 1.
+        let toid: u64 = (123_456u64 << 32) | (7 << 12) | 1;
+        assert_eq!(ledger_sequence_from_paging_token(&toid.to_string()), 123_456);
+        assert_eq!(ledger_sequence_from_paging_token("530841924481025"), 123_596);
+    }
+
+    #[test]
+    fn non_toid_paging_token_decodes_to_zero() {
+        assert_eq!(ledger_sequence_from_paging_token("not-a-toid"), 0);
+    }
 
     #[test]
     fn no_promo_uses_the_base_rate() {
@@ -503,6 +602,78 @@ mod db_tests {
         assert_eq!(row.2.as_deref(), Some("XLM"));
 
         sqlx::query("DELETE FROM payments WHERE id = $1").bind(recorded.id).execute(&store.pool).await.unwrap();
+        sqlx::query("DELETE FROM merchants WHERE id = $1").bind(merchant.id).execute(&store.pool).await.unwrap();
+    }
+
+    // A second, well-formed payment to the same (merchant_id, muxed_id) must
+    // come back Ok — that's what lets poll_once advance its cursor past it —
+    // and must be kept, flagged, rather than dropped.
+    #[tokio::test]
+    #[ignore]
+    async fn second_payment_to_the_same_session_is_recorded_flagged_not_an_error() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres:///konfirm_test".to_string());
+        let store = Store::connect(&url).await.unwrap();
+        let email = format!("dup-{}@example.com", Uuid::new_v4());
+        let address = "GBXBABMFZIJPTOFI6STUXA2FMEXDBB4URBD3VS5XDHKMFHGLJZ5WPQBB";
+        let merchant = store.upsert_merchant_by_stellar_address(address, &email, "Dup Test").await.unwrap();
+        let verdict = Verdict { status: "paid", flag_reason: None };
+
+        let record = |paging: String, tx: &'static str| {
+            let store = store.clone();
+            let merchant = merchant.clone();
+            let verdict = Verdict { status: verdict.status, flag_reason: verdict.flag_reason };
+            async move {
+                store
+                    .record_payment_if_new(
+                        &merchant,
+                        777,
+                        address,
+                        "GDIET4T37N35XU4FY52RMR4Z653WYFITEHGIJXN4VEQTDYR5JSURJDPL",
+                        "XLM",
+                        None,
+                        "1.0000000",
+                        Decimal::ZERO,
+                        None,
+                        None,
+                        &paging,
+                        tx,
+                        &verdict,
+                        "none",
+                        None,
+                        "XLM",
+                        None,
+                    )
+                    .await
+            }
+        };
+
+        let first_paging = format!("dup-paging-1-{}", Uuid::new_v4());
+        let second_paging = format!("dup-paging-2-{}", Uuid::new_v4());
+        let first = record(first_paging, "dup-tx-1").await.unwrap().expect("first payment is new");
+        assert!(!first.duplicate_session);
+
+        let second = record(second_paging.clone(), "dup-tx-2")
+            .await
+            .expect("a second payment to the same session must not be an error")
+            .expect("and must be recorded, not dropped");
+        assert!(second.duplicate_session);
+        assert_ne!(second.id, first.id);
+
+        // Replaying the duplicate's op stays the ordinary dedup no-op.
+        assert!(record(second_paging, "dup-tx-2").await.unwrap().is_none());
+
+        let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, flag_reason FROM payments WHERE merchant_id = $1 AND muxed_id = 777 ORDER BY flag_reason NULLS FIRST",
+        )
+        .bind(merchant.id)
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (first.id, "paid".to_string(), None));
+        assert_eq!(rows[1], (second.id, "held".to_string(), Some("duplicate_session".to_string())));
+
+        sqlx::query("DELETE FROM payments WHERE merchant_id = $1").bind(merchant.id).execute(&store.pool).await.unwrap();
         sqlx::query("DELETE FROM merchants WHERE id = $1").bind(merchant.id).execute(&store.pool).await.unwrap();
     }
 }

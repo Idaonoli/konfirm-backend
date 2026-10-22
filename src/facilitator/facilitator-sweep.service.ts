@@ -125,24 +125,32 @@ export class FacilitatorSweepService {
     }
     const sweepUsdc = Number(sweepStroops) / STROOPS_PER_UNIT;
 
-    // Recorded (and, on a cap breach, halted) BEFORE submission -- see
-    // FacilitatorSpendGuardService's own doc comment for why this fails
-    // closed rather than reconciling after the fact.
-    try {
-      await this.spendGuard.checkAndRecordSpend(sweepUsdc, 'sweep', TREASURY_CONTRACT_ID);
-    } catch (err) {
-      if (err instanceof FacilitatorHalted || err instanceof FacilitatorSpendCapExceeded) {
-        this.logger.warn(`sweep blocked: ${err.message}`);
-        return;
-      }
-      throw err;
-    }
-
+    // Submit first, then record spend only once the transfer is known to
+    // have succeeded. Recording before submission meant a failed/timed-out
+    // transfer still consumed real cap budget for money that never moved,
+    // eventually halting all sweeps under sustained RPC flakiness. The cap
+    // check still runs (and can still halt) -- it just runs against the
+    // amount we're about to move, and only counts it if it actually moved.
     const result = await this.submitTransfer(signer.address, sweepStroops);
     if (!result.success) {
       this.logger.error(`sweep transfer failed: ${result.errorReason}`);
       return;
     }
+
+    try {
+      await this.spendGuard.checkAndRecordSpend(sweepUsdc, 'sweep', TREASURY_CONTRACT_ID);
+    } catch (err) {
+      if (err instanceof FacilitatorHalted || err instanceof FacilitatorSpendCapExceeded) {
+        // The transfer already landed, so the money moved regardless -- log
+        // loudly so an operator can reconcile, but don't pretend it didn't.
+        this.logger.error(
+          `sweep transfer ${result.transaction} succeeded but spend guard rejected recording: ${err.message}`,
+        );
+        return;
+      }
+      throw err;
+    }
+
     this.logger.log(
       `swept ${sweepUsdc.toFixed(7)} USDC from ${signer.address} to treasury ${TREASURY_CONTRACT_ID}: ${result.transaction}`,
     );
